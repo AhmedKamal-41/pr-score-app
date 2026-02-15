@@ -1,0 +1,92 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Testing
+coverage/
+*.lcov
+.nyc_output/
+
+# Production
+dist/
+build/
+.next/
+out/
+*.tsbuildinfo
+
+# Environment variables (all levels)
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS
+.DS_Store
+*.pem
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# Prisma (keep migrations, ignore generated client and DB files)
+backend/prisma/*.db
+backend/prisma/*.db-journal
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# Docker
+.dockerignore
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Build artifacts
+backend/dist/
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Coverage
+coverage/
+*.coverage
+.nyc_output/
+
+# Secrets and keys
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+.secrets/
+
+# Lock files (optional - some teams commit these)
+# pnpm-lock.yaml
+# package-lock.json
+# yarn.lock
+
