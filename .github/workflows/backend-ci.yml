@@ -1,0 +1,52 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches: ['**']
+  push:
+    branches: [main]
+
+jobs:
+  ci:
+    name: Lint, Typecheck & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'pnpm'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter backend db:generate
+
+      - name: Lint
+        run: pnpm --filter backend lint
+
+      - name: Typecheck
+        run: pnpm --filter backend typecheck
+
+      - name: Run tests
+        run: pnpm --filter backend test
+        continue-on-error: false
+
+      - name: Upload test coverage and reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-reports
+          path: backend/coverage/**
+          retention-days: 7
+
