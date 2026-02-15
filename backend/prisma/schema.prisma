@@ -1,0 +1,82 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Repo {
+  id              String   @id @default(uuid())
+  github_repo_id  BigInt   @unique
+  full_name       String
+  owner           String
+  name            String
+  installation_id BigInt
+  private         Boolean  @default(false)
+  created_at      DateTime @default(now())
+  updated_at      DateTime @updatedAt
+
+  pull_requests PullRequest[]
+
+  @@map("repos")
+}
+
+model PullRequest {
+  id                String    @id @default(uuid())
+  repo_id           String
+  github_pr_id      BigInt    @unique
+  title             String
+  state             String    // open, closed, merged
+  author            String
+  head_sha          String
+  base_ref          String
+  head_ref          String
+  additions         Int?
+  deletions         Int?
+  changed_files     Int?
+  changed_files_list Json?    // Array of filenames
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+  merged_at         DateTime?
+
+  repo   Repo       @relation(fields: [repo_id], references: [id], onDelete: Cascade)
+  scores PrScore[]
+  ai_analyses PrAiAnalysis[]
+
+  @@map("pull_requests")
+}
+
+model PrScore {
+  id             String   @id @default(uuid())
+  pull_request_id String
+  score          Float
+  level          String   // low, medium, high, critical
+  reasons        Json     // Array of reason objects
+  features       Json     // Feature extraction data
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  pull_request PullRequest @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+
+  @@map("pr_scores")
+}
+
+model PrAiAnalysis {
+  id             String   @id @default(uuid())
+  pull_request_id String
+  analysis_json  Json     // AI output schema
+  model          String   // e.g., "gpt-4o-mini"
+  prompt_version String   // e.g., "v1"
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  pull_request PullRequest @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+
+  @@map("pr_ai_analyses")
+}
+
