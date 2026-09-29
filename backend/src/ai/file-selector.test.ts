@@ -85,3 +85,28 @@ describe('selectRiskyFiles', () => {
   });
 });
 
+
+describe('selectRiskyFiles (contract details)', () => {
+  it('applies exactly +200 for critical files plus churn', () => {
+    const churn = new Map([
+      ['src/auth/login.ts', { additions: 1, deletions: 2 }],
+      ['src/big.ts', { additions: 150, deletions: 49 }],
+    ]);
+    const [first, second] = selectRiskyFiles(['src/big.ts', 'src/auth/login.ts'], churn);
+    expect(first).toEqual({ filename: 'src/auth/login.ts', risk_score: 203, is_critical: true, churn: 3 });
+    expect(second).toEqual({ filename: 'src/big.ts', risk_score: 199, is_critical: false, churn: 199 });
+  });
+
+  it('breaks ties deterministically by filename', () => {
+    const churn = new Map([
+      ['b.ts', { additions: 5, deletions: 0 }],
+      ['a.ts', { additions: 5, deletions: 0 }],
+    ]);
+    expect(selectRiskyFiles(['b.ts', 'a.ts'], churn).map((f) => f.filename)).toEqual(['a.ts', 'b.ts']);
+  });
+
+  it('does not treat look-alike names as critical', () => {
+    const result = selectRiskyFiles(['src/author.ts'], new Map());
+    expect(result[0].is_critical).toBe(false);
+  });
+});

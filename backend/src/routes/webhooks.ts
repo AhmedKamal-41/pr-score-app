@@ -1,218 +1,125 @@
-import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import rawBody from '@fastify/raw-body';
-import { Webhooks } from '@octokit/webhooks';
-import requestContext from '@fastify/request-context';
-import { scorePrQueue, ScorePrJobData } from '../lib/queue.js';
+import type { FastifyInstance } from 'fastify';
+import fastifyRawBody from 'fastify-raw-body';
+import type { AppConfig } from '../config/env.js';
+import type { DispatchDeps } from '../jobs/dispatch.js';
+import { sendError } from '../http/errors.js';
+import { verifyWebhookSignature } from '../webhooks/signature.js';
+import { classifyWebhook } from '../webhooks/classify.js';
+import { acceptDelivery, payloadDigest } from '../webhooks/inbox.js';
+import { sanitizeErrorForStorage } from '../lib/sanitize.js';
 
-const webhookSecret = process.env.GITHUB_WEBHOOK_SECRET;
+/** GitHub caps webhook payloads at 25 MB. */
+const WEBHOOK_BODY_LIMIT = 25 * 1024 * 1024;
+const DELIVERY_ID = /^[A-Za-z0-9-]{8,100}$/;
+const EVENT_NAME = /^[a-z_]{1,64}$/;
+const INVALID_JSON = Symbol('invalid-json');
 
-if (!webhookSecret) {
-  console.warn(
-    '⚠️  GITHUB_WEBHOOK_SECRET is not set. Webhook signature verification will fail.'
-  );
-}
+/**
+ * POST /webhooks/github
+ *
+ * Order of operations:
+ *   1. signature over the exact raw bytes (401 when missing/malformed/wrong),
+ *   2. required headers (400), JSON (400), payload validation (400),
+ *   3. ping → 200; ignored events → 202 without storage or jobs,
+ *   4. durable insert into webhook_deliveries, then enqueue,
+ *   5. 202 only after the row is committed; 503 if it could not be stored.
+ * Note: GitHub does not automatically redeliver failed deliveries — see the
+ * recovery procedure in project.md.
+ */
+export async function webhookRoutes(fastify: FastifyInstance, opts: { config: AppConfig; dispatch: DispatchDeps }) {
+  const { config, dispatch } = opts;
 
-const webhooks = new Webhooks({
-  secret: webhookSecret || '',
-});
-
-export async function webhookRoute(fastify: FastifyInstance) {
-  // Register raw-body plugin for this route scope
-  await fastify.register(rawBody, {
+  // Encapsulated: these parsers and the raw-body capture apply only here.
+  await fastify.register(fastifyRawBody, {
     field: 'rawBody',
     global: false,
-    encoding: 'utf8',
+    encoding: false, // Buffer: HMAC is computed over the original bytes
     runFirst: true,
   });
+  // Parse leniently so an invalid-JSON body with a bad signature is answered
+  // 401 (signature is checked first), never 400. Removing the inherited
+  // parsers only affects this encapsulated scope.
+  fastify.removeAllContentTypeParsers();
+  fastify.addContentTypeParser('application/json', { parseAs: 'buffer', bodyLimit: WEBHOOK_BODY_LIMIT }, (_req, body, done) => {
+    try {
+      done(null, JSON.parse((body as Buffer).toString('utf8')));
+    } catch {
+      done(null, INVALID_JSON);
+    }
+  });
+  fastify.addContentTypeParser('*', { parseAs: 'buffer', bodyLimit: WEBHOOK_BODY_LIMIT }, (_req, _body, done) => done(null, INVALID_JSON));
 
   fastify.post(
     '/webhooks/github',
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      const requestId = requestContext.get('requestId') || 'unknown';
-
-      // Check if webhook secret is configured
-      if (!webhookSecret) {
-        fastify.log.error(
-          { requestId },
-          'GITHUB_WEBHOOK_SECRET is not configured'
-        );
-        return reply.status(500).send({
-          error: {
-            message: 'Webhook secret not configured',
-            code: 'CONFIGURATION_ERROR',
-            requestId,
-          },
-        });
+    { config: { rawBody: true }, bodyLimit: WEBHOOK_BODY_LIMIT },
+    async (request, reply) => {
+      if (!config.github.enabled || !config.github.webhookSecret) {
+        return sendError(reply, 503, 'GITHUB_DISABLED', 'GitHub integration is disabled on this server');
+      }
+      const raw = request.rawBody;
+      if (!Buffer.isBuffer(raw)) {
+        request.log.error('Raw webhook body was not captured');
+        return sendError(reply, 500, 'INTERNAL_ERROR', 'Internal server error');
       }
 
-      // Get signature from headers
-      const signature = request.headers['x-hub-signature-256'] as string;
-      if (!signature) {
-        fastify.log.warn(
-          { requestId },
-          'Missing X-Hub-Signature-256 header'
-        );
-        return reply.status(401).send({
-          error: {
-            message: 'Missing signature header',
-            code: 'UNAUTHORIZED',
-            requestId,
-          },
-        });
+      const signatureHeader = request.headers['x-hub-signature-256'];
+      const signature = verifyWebhookSignature(
+        config.github.webhookSecret,
+        raw,
+        typeof signatureHeader === 'string' ? signatureHeader : undefined,
+      );
+      if (signature !== 'valid') {
+        request.log.warn({ signature }, 'Rejected webhook with bad signature');
+        const message =
+          signature === 'missing' ? 'Missing X-Hub-Signature-256 header' : signature === 'malformed' ? 'Malformed signature header' : 'Invalid webhook signature';
+        return sendError(reply, 401, 'UNAUTHORIZED', message);
       }
 
-      // Get raw body (as Buffer from @fastify/raw-body)
-      const rawBody = (request as any).rawBody as Buffer | string;
-      if (!rawBody) {
-        fastify.log.error(
-          { requestId },
-          'Raw body is missing. Ensure @fastify/raw-body is registered for this route.'
-        );
-        return reply.status(500).send({
-          error: {
-            message: 'Internal server error',
-            code: 'INTERNAL_ERROR',
-            requestId,
-          },
-        });
+      const event = request.headers['x-github-event'];
+      const deliveryId = request.headers['x-github-delivery'];
+      if (typeof event !== 'string' || !EVENT_NAME.test(event)) {
+        return sendError(reply, 400, 'BAD_REQUEST', 'Missing or invalid X-GitHub-Event header');
+      }
+      if (typeof deliveryId !== 'string' || !DELIVERY_ID.test(deliveryId)) {
+        return sendError(reply, 400, 'BAD_REQUEST', 'Missing or invalid X-GitHub-Delivery header');
+      }
+      const contentType = request.headers['content-type'] ?? '';
+      if (!contentType.startsWith('application/json')) {
+        return sendError(reply, 415, 'UNSUPPORTED_MEDIA_TYPE', 'Webhook content type must be application/json');
+      }
+      if (request.body === INVALID_JSON || typeof request.body !== 'object' || request.body === null) {
+        return sendError(reply, 400, 'BAD_REQUEST', 'Invalid JSON payload');
       }
 
-      const bodyString = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8');
+      const classification = classifyWebhook(event, request.body, config);
+      switch (classification.kind) {
+        case 'ping':
+          return reply.status(200).send({ ok: true, event: 'ping' });
+        case 'ignore':
+          request.log.info({ event, deliveryId, reason: classification.reason }, 'Webhook ignored');
+          return reply.status(202).send({ status: 'ignored', reason: classification.reason });
+        case 'invalid':
+          return sendError(reply, 400, 'INVALID_PAYLOAD', classification.message, classification.details);
+        case 'accept':
+          break;
+      }
 
-      // Verify signature using @octokit/webhooks
+      let outcome;
       try {
-        const signatureWithoutPrefix = signature.replace('sha256=', '');
-        
-        // Verify the signature
-        const isValid = webhooks.verify(bodyString, signatureWithoutPrefix);
-        
-        if (!isValid) {
-          throw new Error('Signature verification failed');
-        }
-      } catch (error: any) {
-        fastify.log.warn(
-          {
-            requestId,
-            error: error.message,
-          },
-          'Webhook signature verification failed'
-        );
-        return reply.status(401).send({
-          error: {
-            message: 'Invalid webhook signature',
-            code: 'UNAUTHORIZED',
-            requestId,
-          },
-        });
+        outcome = await acceptDelivery(dispatch, deliveryId, payloadDigest(raw), classification.row);
+      } catch (err) {
+        request.log.error({ deliveryId, err: sanitizeErrorForStorage(err) }, 'Could not durably store webhook delivery');
+        return sendError(reply, 503, 'STORAGE_UNAVAILABLE', 'Delivery could not be stored; redeliver it from GitHub once the service is healthy');
       }
 
-      // Parse the payload
-      let payload: any;
-      try {
-        payload = JSON.parse(bodyString);
-      } catch (error: any) {
-        fastify.log.error(
-          {
-            requestId,
-            error: error.message,
-          },
-          'Failed to parse webhook payload'
-        );
-        return reply.status(400).send({
-          error: {
-            message: 'Invalid JSON payload',
-            code: 'BAD_REQUEST',
-            requestId,
-          },
-        });
+      if (outcome.result === 'conflict') {
+        request.log.warn({ deliveryId }, 'Delivery id reused with different content');
+        return sendError(reply, 409, 'DELIVERY_ID_CONFLICT', 'This delivery id was already received with different content');
       }
-
-      // Get event type and delivery ID from headers
-      const eventType = request.headers['x-github-event'] as string;
-      const deliveryId = request.headers['x-github-delivery'] as string;
-
-      // Handle pull_request events - enqueue job for async processing
-      if (eventType === 'pull_request') {
-        const action = payload.action;
-        const supportedActions = ['opened', 'synchronize'];
-        
-        if (supportedActions.includes(action)) {
-          // Extract repository info
-          const repository = payload.repository;
-          const owner = repository.owner?.login || repository.full_name.split('/')[0];
-          const name = repository.name || repository.full_name.split('/')[1];
-          const prNumber = payload.pull_request?.number;
-          const installationId = payload.installation?.id;
-
-          if (!prNumber) {
-            fastify.log.warn(
-              { requestId, payload: payload.pull_request },
-              'Missing PR number in payload'
-            );
-            return reply.status(200).send({ received: true });
-          }
-
-          // Prepare job data
-          const jobData: ScorePrJobData = {
-            owner,
-            name,
-            pr_number: prNumber,
-            delivery_id: deliveryId || requestId,
-          };
-
-          if (installationId) {
-            jobData.installation_id = installationId;
-          }
-
-          // Enqueue job immediately
-          try {
-            await scorePrQueue.add('score_pr', jobData, {
-              jobId: `pr-${owner}-${name}-${prNumber}-${deliveryId || Date.now()}`,
-            });
-
-            fastify.log.info(
-              {
-                requestId,
-                jobId: `pr-${owner}-${name}-${prNumber}-${deliveryId || Date.now()}`,
-                owner,
-                name,
-                prNumber,
-              },
-              'Enqueued score_pr job'
-            );
-          } catch (error: any) {
-            fastify.log.error(
-              {
-                requestId,
-                error: error.message,
-              },
-              'Failed to enqueue score_pr job'
-            );
-            // Still return 200 to acknowledge webhook receipt
-          }
-        } else {
-          fastify.log.debug(
-            {
-              requestId,
-              event: 'pull_request',
-              action,
-            },
-            'Ignoring unsupported pull_request action'
-          );
-        }
-      } else {
-        fastify.log.debug(
-          {
-            requestId,
-            eventType,
-          },
-          'Received unsupported webhook event type'
-        );
+      if (outcome.result === 'duplicate') {
+        return reply.status(200).send({ status: 'duplicate', delivery_status: outcome.status });
       }
-
-      // Always return 200 OK immediately (<100ms) to acknowledge receipt
-      return reply.status(200).send({ received: true });
-    }
+      return reply.status(202).send({ status: outcome.result, queued: outcome.enqueued });
+    },
   );
 }
-

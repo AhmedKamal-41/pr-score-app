@@ -1,219 +1,191 @@
-// Editable scoring rule constants
+import { SCORING_VERSION } from '../config/constants.js';
+import { criticalCategoriesFor, isTestFile, type CriticalCategory } from './paths.js';
+
+/**
+ * Deterministic PR risk scoring, contract v2.
+ *
+ * Rules (a higher threshold replaces the lower one within the same rule):
+ *   1. Files changed      > 20 → +20,  > 50 → +40
+ *   2. Lines changed      > 500 → +20, > 1000 → +40   (additions + deletions)
+ *   3. Critical areas     1 category → +20, 2+ categories → +40
+ *   4. No test files changed (and at least one file changed) → +20
+ *   5. CI status          failure → +20; success → 0;
+ *                         pending / unknown → 0, reported as uncertainty
+ * Score = min(100, sum). Levels: LOW ≤ 30, MED ≤ 70, HIGH > 70.
+ *
+ * Change from the legacy contract: "unknown" CI used to add +20 to every PR
+ * because CI was never fetched. v2 uses fetched CI and only penalises failure.
+ * Historical scores keep scoring_version = "legacy" and are not rewritten.
+ *
+ * A score is a review-prioritisation heuristic. It does not prove correctness,
+ * and a changed test file does not prove test coverage.
+ */
+
 export const SCORING_RULES = {
-  // PR Size thresholds
   SIZE: {
-    HIGH_FILES: 50, // Files changed > 50 → HIGH risk
-    MED_FILES: 20, // Files changed > 20 → MED risk
-    HIGH_LINES: 1000, // Lines changed > 1000 → HIGH risk
-    MED_LINES: 500, // Lines changed > 500 → MED risk
+    HIGH_FILES: 50,
+    MED_FILES: 20,
+    HIGH_LINES: 1000,
+    MED_LINES: 500,
   },
-  
-  // Critical path patterns (case-insensitive)
-  CRITICAL_PATHS: [
-    { pattern: /auth|authentication|login|session/i, name: 'Authentication' },
-    { pattern: /payment|payments|billing|invoice/i, name: 'Payments' },
-    { pattern: /config|configuration|settings/i, name: 'Configuration' },
-    { pattern: /infra|infrastructure|deploy|deployment/i, name: 'Infrastructure' },
-    { pattern: /migration|migrations|schema/i, name: 'Migrations' },
-    { pattern: /\.github\//i, name: 'GitHub Actions' },
-  ],
-  
-  // Test file patterns
-  TEST_PATTERNS: [
-    /test/i,
-    /spec/i,
-    /__tests__/i,
-    /tests\//i,
-  ],
-  
-  // Score penalties
   PENALTIES: {
-    HIGH: 40, // HIGH risk rule → +40 points
-    MED: 20, // MED risk rule → +20 points
+    HIGH: 40,
+    MED: 20,
   },
-  
-  // Score level thresholds
   LEVELS: {
-    LOW: 30, // 0-30: LOW
-    MED: 70, // 31-70: MED
-    // 71-100: HIGH
+    LOW: 30,
+    MED: 70,
   },
+  MAX_SCORE: 100,
+  TOP_REASONS: 3,
 } as const;
+
+export type CiStatus = 'success' | 'failure' | 'pending' | 'unknown';
+export type RiskLevel = 'LOW' | 'MED' | 'HIGH';
+export type RuleId = 'files' | 'lines' | 'critical_paths' | 'no_tests' | 'ci';
+
+export interface FileCoverage {
+  /** File count reported by GitHub for the PR. */
+  expected_files: number;
+  /** Files actually listed (GitHub caps pull request file listings). */
+  listed_files: number;
+  complete: boolean;
+}
 
 export interface ScoringInput {
   changed_files: number;
   additions: number;
   deletions: number;
   changed_files_list: string[];
-  ci_status?: 'success' | 'failure' | 'pending' | 'unknown';
+  ci_status: CiStatus;
+  /** Optional detail explaining a pending/unknown CI state. */
+  ci_reason?: string;
+  coverage?: FileCoverage;
+}
+
+export interface RuleContribution {
+  rule: RuleId;
+  points: number;
+  severity: 'HIGH' | 'MED';
+  reason: string;
 }
 
 export interface ScoringResult {
-  score: number; // 0-100
-  level: 'LOW' | 'MED' | 'HIGH';
-  reasons: string[]; // Top 3 reasons
+  score: number;
+  level: RiskLevel;
+  /** Top three reasons, highest contribution first. */
+  reasons: string[];
+  /** Every rule that contributed points (explains the full score). */
+  contributions: RuleContribution[];
+  /** Inputs that were not scored but limit confidence (pending CI, partial file list…). */
+  uncertainties: string[];
+  scoring_version: string;
   features: {
     files_changed: number;
     lines_changed: number;
+    files_analyzed: number;
     touches_critical_paths: boolean;
-    critical_paths_touched: string[];
+    critical_paths_touched: CriticalCategory[];
     has_test_changes: boolean;
-    ci_status?: string;
+    ci_status: CiStatus;
+    raw_score: number;
   };
 }
 
-interface RuleResult {
-  reason: string;
-  severity: 'HIGH' | 'MED';
+export function levelForScore(score: number): RiskLevel {
+  if (score <= SCORING_RULES.LEVELS.LOW) return 'LOW';
+  if (score <= SCORING_RULES.LEVELS.MED) return 'MED';
+  return 'HIGH';
 }
 
-/**
- * Check if a file path matches test patterns
- */
-function isTestFile(filePath: string): boolean {
-  return SCORING_RULES.TEST_PATTERNS.some((pattern) => pattern.test(filePath));
+/** Database/API representation of a level. */
+export function levelToApi(level: RiskLevel): 'low' | 'medium' | 'high' {
+  return level === 'LOW' ? 'low' : level === 'MED' ? 'medium' : 'high';
 }
 
-/**
- * Check if a file path touches critical paths
- */
-function touchesCriticalPath(filePath: string): { touched: boolean; pathName: string | null } {
-  for (const { pattern, name } of SCORING_RULES.CRITICAL_PATHS) {
-    if (pattern.test(filePath)) {
-      return { touched: true, pathName: name };
-    }
-  }
-  return { touched: false, pathName: null };
-}
+const RULE_ORDER: readonly RuleId[] = ['files', 'lines', 'critical_paths', 'no_tests', 'ci'];
 
-/**
- * Compute PR risk score based on rules
- */
 export function computeScore(input: ScoringInput): ScoringResult {
   const { changed_files, additions, deletions, changed_files_list, ci_status } = input;
-  const lines_changed = additions + deletions;
-  
-  const rules: RuleResult[] = [];
-  const criticalPathsTouched: string[] = [];
+  const linesChanged = additions + deletions;
+  const { PENALTIES, SIZE } = SCORING_RULES;
+
+  const categories = new Set<CriticalCategory>();
   let hasTestChanges = false;
-  
-  // Check each file for critical paths and test files
-  for (const filePath of changed_files_list) {
-    const criticalCheck = touchesCriticalPath(filePath);
-    if (criticalCheck.touched && criticalCheck.pathName) {
-      if (!criticalPathsTouched.includes(criticalCheck.pathName)) {
-        criticalPathsTouched.push(criticalCheck.pathName);
-      }
-    }
-    
-    if (isTestFile(filePath)) {
-      hasTestChanges = true;
-    }
+  for (const file of changed_files_list) {
+    for (const c of criticalCategoriesFor(file)) categories.add(c);
+    if (isTestFile(file)) hasTestChanges = true;
   }
-  
-  // Rule 1: Big PR size (files)
-  if (changed_files > SCORING_RULES.SIZE.HIGH_FILES) {
-    rules.push({
-      reason: `Large PR: ${changed_files} files changed (threshold: ${SCORING_RULES.SIZE.HIGH_FILES})`,
-      severity: 'HIGH',
-    });
-  } else if (changed_files > SCORING_RULES.SIZE.MED_FILES) {
-    rules.push({
-      reason: `Medium PR: ${changed_files} files changed (threshold: ${SCORING_RULES.SIZE.MED_FILES})`,
-      severity: 'MED',
-    });
+  const criticalList = [...categories];
+
+  const contributions: RuleContribution[] = [];
+  const high = (rule: RuleId, reason: string) =>
+    contributions.push({ rule, points: PENALTIES.HIGH, severity: 'HIGH', reason });
+  const med = (rule: RuleId, reason: string) =>
+    contributions.push({ rule, points: PENALTIES.MED, severity: 'MED', reason });
+
+  if (changed_files > SIZE.HIGH_FILES) {
+    high('files', `Large PR: ${changed_files} files changed (threshold: ${SIZE.HIGH_FILES})`);
+  } else if (changed_files > SIZE.MED_FILES) {
+    med('files', `Medium PR: ${changed_files} files changed (threshold: ${SIZE.MED_FILES})`);
   }
-  
-  // Rule 2: Big PR size (lines)
-  if (lines_changed > SCORING_RULES.SIZE.HIGH_LINES) {
-    rules.push({
-      reason: `Large PR: ${lines_changed} lines changed (threshold: ${SCORING_RULES.SIZE.HIGH_LINES})`,
-      severity: 'HIGH',
-    });
-  } else if (lines_changed > SCORING_RULES.SIZE.MED_LINES) {
-    rules.push({
-      reason: `Medium PR: ${lines_changed} lines changed (threshold: ${SCORING_RULES.SIZE.MED_LINES})`,
-      severity: 'MED',
-    });
+
+  if (linesChanged > SIZE.HIGH_LINES) {
+    high('lines', `Large PR: ${linesChanged} lines changed (threshold: ${SIZE.HIGH_LINES})`);
+  } else if (linesChanged > SIZE.MED_LINES) {
+    med('lines', `Medium PR: ${linesChanged} lines changed (threshold: ${SIZE.MED_LINES})`);
   }
-  
-  // Rule 3: Critical paths touched
-  if (criticalPathsTouched.length > 0) {
-    const pathsList = criticalPathsTouched.join(', ');
-    // Multiple critical paths = HIGH, single = MED
-    if (criticalPathsTouched.length > 1) {
-      rules.push({
-        reason: `Touches multiple critical paths: ${pathsList}`,
-        severity: 'HIGH',
-      });
-    } else {
-      rules.push({
-        reason: `Touches critical path: ${pathsList}`,
-        severity: 'MED',
-      });
-    }
+
+  if (criticalList.length > 1) {
+    high('critical_paths', `Touches multiple critical areas: ${criticalList.join(', ')}`);
+  } else if (criticalList.length === 1) {
+    med('critical_paths', `Touches critical area: ${criticalList[0]}`);
   }
-  
-  // Rule 4: No tests changed
+
   if (changed_files > 0 && !hasTestChanges) {
-    rules.push({
-      reason: 'No test files changed',
-      severity: 'MED',
-    });
+    med('no_tests', 'No test files changed');
   }
-  
-  // Rule 5: CI status (for future use)
-  if (ci_status === 'failure' || ci_status === 'unknown') {
-    rules.push({
-      reason: `CI status: ${ci_status}`,
-      severity: 'MED',
-    });
+
+  const uncertainties: string[] = [];
+  if (ci_status === 'failure') {
+    med('ci', 'CI failed for this revision');
+  } else if (ci_status === 'pending' || ci_status === 'unknown') {
+    uncertainties.push(
+      `CI status is ${ci_status}${input.ci_reason ? ` (${input.ci_reason})` : ''}; not scored`,
+    );
   }
-  
-  // Calculate score
-  let score = 0;
-  for (const rule of rules) {
-    if (rule.severity === 'HIGH') {
-      score += SCORING_RULES.PENALTIES.HIGH;
-    } else {
-      score += SCORING_RULES.PENALTIES.MED;
-    }
+
+  if (input.coverage && !input.coverage.complete) {
+    uncertainties.push(
+      `Only ${input.coverage.listed_files} of ${input.coverage.expected_files} changed files could be listed; ` +
+        'critical-area and test detection used the listed files only',
+    );
   }
-  
-  // Cap score at 100
-  score = Math.min(score, 100);
-  
-  // Determine level
-  let level: 'LOW' | 'MED' | 'HIGH';
-  if (score <= SCORING_RULES.LEVELS.LOW) {
-    level = 'LOW';
-  } else if (score <= SCORING_RULES.LEVELS.MED) {
-    level = 'MED';
-  } else {
-    level = 'HIGH';
-  }
-  
-  // Get top 3 reasons (prioritize HIGH severity, then by order)
-  const sortedRules = [...rules].sort((a, b) => {
-    if (a.severity === 'HIGH' && b.severity !== 'HIGH') return -1;
-    if (a.severity !== 'HIGH' && b.severity === 'HIGH') return 1;
-    return 0;
-  });
-  
-  const topReasons = sortedRules.slice(0, 3).map((r) => r.reason);
-  
+
+  const rawScore = contributions.reduce((sum, c) => sum + c.points, 0);
+  const score = Math.min(rawScore, SCORING_RULES.MAX_SCORE);
+
+  // Deterministic ordering: points desc, then fixed rule order.
+  const ordered = [...contributions].sort(
+    (a, b) => b.points - a.points || RULE_ORDER.indexOf(a.rule) - RULE_ORDER.indexOf(b.rule),
+  );
+
   return {
     score,
-    level,
-    reasons: topReasons,
+    level: levelForScore(score),
+    reasons: ordered.slice(0, SCORING_RULES.TOP_REASONS).map((c) => c.reason),
+    contributions: ordered,
+    uncertainties,
+    scoring_version: SCORING_VERSION,
     features: {
       files_changed: changed_files,
-      lines_changed,
-      touches_critical_paths: criticalPathsTouched.length > 0,
-      critical_paths_touched: criticalPathsTouched,
+      lines_changed: linesChanged,
+      files_analyzed: changed_files_list.length,
+      touches_critical_paths: criticalList.length > 0,
+      critical_paths_touched: criticalList,
       has_test_changes: hasTestChanges,
       ci_status,
+      raw_score: rawScore,
     },
   };
 }
-

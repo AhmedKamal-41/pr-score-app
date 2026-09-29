@@ -1,122 +1,153 @@
-import OpenAI from 'openai';
-import { AiInput, AiOutput } from './types.js';
-import { buildPrompt } from './prompt-builder.js';
+import OpenAI, { type ClientOptions } from 'openai';
+import type { AiOutput } from './types.js';
 import { validateAiOutput } from './validator.js';
 
-const AI_TIMEOUT_MS = 10000; // 10 seconds
-const MAX_RETRIES = 2;
-
 /**
- * Generate AI analysis for a PR
+ * OpenAI chat-completions client for the structured PR review.
+ *
+ * Retry policy (the only one; the SDK's own retries are disabled):
+ *   - at most `maxAttempts` (default 2) attempts in total;
+ *   - retried: HTTP 429, HTTP 5xx, connection errors and our timeout;
+ *   - not retried: other 4xx, empty/malformed JSON, schema or safety failures;
+ *   - backoff: 1 s, or Retry-After when the provider sends one (capped at 5 s).
+ * Every attempt has a real deadline: an AbortController cancels the HTTP
+ * request and its timer is always cleared.
  */
-export async function generateAiAnalysis(input: AiInput): Promise<{
-  success: boolean;
-  output?: AiOutput;
-  error?: string;
-}> {
-  const provider = process.env.AI_PROVIDER || 'openai';
-  const apiKey = process.env.OPENAI_API_KEY;
-  const model = process.env.AI_MODEL || 'gpt-4o-mini';
 
-  if (!apiKey) {
-    return {
-      success: false,
-      error: 'OPENAI_API_KEY not configured',
-    };
-  }
+export interface AiClientOptions {
+  apiKey: string | null;
+  model: string;
+  baseUrl?: string | null;
+  timeoutMs: number;
+  maxAttempts?: number;
+  /** Injected for tests; defaults to global fetch. */
+  fetch?: typeof fetch;
+  sleep?: (ms: number) => Promise<void>;
+}
 
-  if (provider !== 'openai') {
-    return {
-      success: false,
-      error: `Unsupported AI provider: ${provider}`,
-    };
-  }
+export type AiFailureKind =
+  /** Missing credentials or configuration. */
+  | 'config'
+  /** Provider unreachable, rate limited, timed out or erroring. */
+  | 'unavailable'
+  /** Provider answered, but not with valid, safe output. */
+  | 'invalid_output';
 
-  try {
-    const client = new OpenAI({
-      apiKey,
-      timeout: AI_TIMEOUT_MS,
-    });
+export type AiResult =
+  | { ok: true; output: AiOutput; attempts: number }
+  | { ok: false; kind: AiFailureKind; error: string; attempts: number };
 
-    const prompt = buildPrompt(input);
+const MAX_RETRY_AFTER_MS = 5_000;
+const DEFAULT_BACKOFF_MS = 1_000;
+const MAX_OUTPUT_TOKENS = 1000;
 
-    let lastError: Error | null = null;
+const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-    // Retry logic (max 2 retries)
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      try {
-        const completion = await Promise.race([
-          client.chat.completions.create({
-            model,
-            messages: [
-              {
-                role: 'system',
-                content:
-                  'You are a code review assistant. Analyze PR risk and provide actionable, grounded insights. Always respond with valid JSON matching the requested schema.',
-              },
-              {
-                role: 'user',
-                content: prompt,
-              },
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0.3, // Lower temperature for more consistent output
-            max_tokens: 1000, // Limit response size
-          }),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('AI request timeout')), AI_TIMEOUT_MS)
-          ),
-        ]);
-
-        const content = completion.choices[0]?.message?.content;
-        if (!content) {
-          throw new Error('Empty response from AI');
-        }
-
-        // Parse JSON response
-        let parsed: unknown;
-        try {
-          parsed = JSON.parse(content);
-        } catch (parseError) {
-          throw new Error(`Failed to parse AI response as JSON: ${parseError}`);
-        }
-
-        // Validate output
-        const validation = validateAiOutput(parsed);
-        if (!validation.valid) {
-          throw new Error(`AI output validation failed: ${validation.error}`);
-        }
-
-        return {
-          success: true,
-          output: validation.data,
-        };
-      } catch (error: any) {
-        lastError = error;
-
-        // Don't retry on validation errors or timeout
-        if (
-          error.message?.includes('validation failed') ||
-          error.message?.includes('timeout') ||
-          attempt === MAX_RETRIES
-        ) {
-          break;
-        }
-
-        // Wait before retry (exponential backoff)
-        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
-      }
-    }
-
-    return {
-      success: false,
-      error: lastError?.message || 'Unknown error during AI analysis',
-    };
-  } catch (error: any) {
-    return {
-      success: false,
-      error: error.message || 'Failed to generate AI analysis',
-    };
+class AttemptError extends Error {
+  constructor(
+    message: string,
+    public readonly kind: AiFailureKind,
+    public readonly retryable: boolean,
+    public readonly retryAfterMs?: number,
+  ) {
+    super(message);
   }
 }
 
+/** openai v4 exposes error headers as a plain record; tolerate a Headers instance too. */
+function retryAfterMs(headers: unknown): number | undefined {
+  let value: string | null | undefined;
+  if (headers instanceof Headers) value = headers.get('retry-after');
+  else if (headers && typeof headers === 'object') value = (headers as Record<string, string | undefined>)['retry-after'];
+  if (!value) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds)) return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS);
+  return undefined;
+}
+
+function classify(err: unknown, timedOut: boolean): AttemptError {
+  if (timedOut) return new AttemptError('AI request timed out', 'unavailable', true);
+  if (err instanceof OpenAI.APIError && typeof err.status === 'number') {
+    const status = err.status;
+    if (status === 429) return new AttemptError('AI provider rate limited the request (429)', 'unavailable', true, retryAfterMs(err.headers));
+    if (status >= 500) return new AttemptError(`AI provider error (${status})`, 'unavailable', true);
+    if (status === 401 || status === 403) return new AttemptError(`AI provider rejected credentials (${status})`, 'config', false);
+    return new AttemptError(`AI provider rejected the request (${status})`, 'unavailable', false);
+  }
+  if (err instanceof OpenAI.APIConnectionError) {
+    return new AttemptError('AI provider connection failed', 'unavailable', true);
+  }
+  if (err instanceof AttemptError) return err;
+  return new AttemptError(`AI request failed: ${err instanceof Error ? err.name : 'unknown error'}`, 'unavailable', false);
+}
+
+export async function generateAiAnalysis(
+  prompt: { system: string; user: string },
+  options: AiClientOptions,
+): Promise<AiResult> {
+  if (!options.apiKey) {
+    return { ok: false, kind: 'config', error: 'OPENAI_API_KEY not configured', attempts: 0 };
+  }
+  const maxAttempts = options.maxAttempts ?? 2;
+  const sleep = options.sleep ?? defaultSleep;
+  const client = new OpenAI({
+    apiKey: options.apiKey,
+    baseURL: options.baseUrl ?? undefined,
+    maxRetries: 0,
+    // Backstop only; the per-attempt AbortController below is authoritative.
+    timeout: options.timeoutMs + 5_000,
+    // The SDK declares its own structural Fetch type (URLLike etc.); the
+    // platform fetch is runtime-compatible, so adapt it at this boundary.
+    fetch: (options.fetch ?? globalThis.fetch) as unknown as ClientOptions['fetch'],
+  });
+
+  let last: AttemptError | undefined;
+  let attemptsMade = 0;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    attemptsMade = attempt;
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, options.timeoutMs);
+    try {
+      const completion = await client.chat.completions.create(
+        {
+          model: options.model,
+          messages: [
+            { role: 'system', content: prompt.system },
+            { role: 'user', content: prompt.user },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0.2,
+          max_tokens: MAX_OUTPUT_TOKENS,
+        },
+        { signal: controller.signal },
+      );
+      const content = completion.choices[0]?.message?.content;
+      if (!content) throw new AttemptError('AI returned an empty response', 'invalid_output', false);
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(content);
+      } catch {
+        throw new AttemptError('AI response was not valid JSON', 'invalid_output', false);
+      }
+      const validation = validateAiOutput(parsed);
+      if (!validation.valid) throw new AttemptError(validation.error, 'invalid_output', false);
+      return { ok: true, output: validation.data, attempts: attempt };
+    } catch (err) {
+      last = classify(err, timedOut);
+      if (!last.retryable || attempt === maxAttempts) break;
+      await sleep(last.retryAfterMs ?? DEFAULT_BACKOFF_MS);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return {
+    ok: false,
+    kind: last?.kind ?? 'unavailable',
+    error: last?.message ?? 'AI analysis failed',
+    attempts: attemptsMade,
+  };
+}

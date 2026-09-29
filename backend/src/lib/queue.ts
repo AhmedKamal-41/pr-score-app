@@ -1,53 +1,29 @@
 import { Queue } from 'bullmq';
-import Redis from 'ioredis';
-import dotenv from 'dotenv';
+import type { Redis } from 'ioredis';
+import { EVENTS_QUEUE } from '../config/constants.js';
 
-dotenv.config();
-
-const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-
-// Create Redis connection
-const connection = new Redis(redisUrl, {
-  maxRetriesPerRequest: null,
-  enableReadyCheck: false,
-});
-
-// Job data interface
-export interface ScorePrJobData {
-  owner: string;
-  name: string;
-  pr_number: number;
-  installation_id?: number;
-  delivery_id: string;
+/** Queue payload: only a pointer to the durable delivery row. */
+export interface DeliveryJobData {
+  deliveryId: string;
 }
 
-// Create queue instance
-export const scorePrQueue = new Queue<ScorePrJobData>('score_pr', {
-  connection,
-  defaultJobOptions: {
-    attempts: 3,
-    backoff: {
-      type: 'exponential',
-      delay: 2000,
-    },
-    removeOnComplete: {
-      age: 3600, // Keep completed jobs for 1 hour
-      count: 1000, // Keep max 1000 completed jobs
-    },
-    removeOnFail: {
-      age: 86400, // Keep failed jobs for 24 hours
-    },
-  },
-});
+export type EventsQueue = Queue<DeliveryJobData>;
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  await scorePrQueue.close();
-  await connection.quit();
-});
+export function createEventsQueue(connection: Redis): EventsQueue {
+  return new Queue<DeliveryJobData>(EVENTS_QUEUE, {
+    connection,
+    defaultJobOptions: {
+      // Exactly one BullMQ attempt per enqueue. Retries are scheduled durably
+      // in PostgreSQL (webhook_deliveries.next_attempt_at) by the dispatcher,
+      // so they survive Redis loss and are not multiplied across layers.
+      attempts: 1,
+      removeOnComplete: { age: 3600, count: 1000 },
+      removeOnFail: { age: 86_400 },
+    },
+  });
+}
 
-process.on('SIGINT', async () => {
-  await scorePrQueue.close();
-  await connection.quit();
-});
-
+/** BullMQ job id for a given delivery attempt. Deterministic so re-dispatch deduplicates. */
+export function deliveryJobId(deliveryId: string, attempts: number): string {
+  return `delivery__${deliveryId}__${attempts}`;
+}

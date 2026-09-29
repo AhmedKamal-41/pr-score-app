@@ -1,107 +1,28 @@
-import { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import requestContext from '@fastify/request-context';
-import { seedDemoPRs } from '../../scripts/demo_seed_pr.js';
+import type { FastifyInstance } from 'fastify';
+import type { PrismaClient } from '@prisma/client';
+import type { AppConfig } from '../config/env.js';
+import { requireAdmin, requireTrustedOrigin } from '../http/auth.js';
+import { sendError } from '../http/errors.js';
+import { seedDemoData } from '../demo/seed.js';
 
-export async function demoRoute(fastify: FastifyInstance) {
-  fastify.post(
-    '/api/demo/seed',
-    async (request: FastifyRequest, reply: FastifyReply) => {
-      const requestId = requestContext.get('requestId') || 'unknown';
-
-      // Check if in production
-      if (process.env.NODE_ENV === 'production') {
-        fastify.log.warn(
-          { requestId },
-          'Demo seed endpoint called in production - blocked'
-        );
-        return reply.status(403).send({
-          error: {
-            message: 'Demo mode is disabled in production',
-            code: 'FORBIDDEN',
-            requestId,
-          },
-        });
-      }
-
-      // Check for demo secret
-      const demoSecret = process.env.DEMO_SECRET;
-      if (!demoSecret) {
-        fastify.log.warn(
-          { requestId },
-          'DEMO_SECRET not configured - demo endpoint disabled'
-        );
-        return reply.status(403).send({
-          error: {
-            message: 'Demo mode is not configured',
-            code: 'FORBIDDEN',
-            requestId,
-          },
-        });
-      }
-
-      // Get secret from header
-      const providedSecret = request.headers['x-demo-secret'] as string;
-      if (!providedSecret) {
-        fastify.log.warn(
-          { requestId },
-          'Demo seed endpoint called without secret'
-        );
-        return reply.status(401).send({
-          error: {
-            message: 'Missing demo secret',
-            code: 'UNAUTHORIZED',
-            requestId,
-          },
-        });
-      }
-
-      // Verify secret
-      if (providedSecret !== demoSecret) {
-        fastify.log.warn(
-          { requestId },
-          'Demo seed endpoint called with invalid secret'
-        );
-        return reply.status(401).send({
-          error: {
-            message: 'Invalid demo secret',
-            code: 'UNAUTHORIZED',
-            requestId,
-          },
-        });
-      }
-
-      // Execute seed
-      try {
-        fastify.log.info({ requestId }, 'Starting demo seed');
-        const prsCreated = await seedDemoPRs();
-        fastify.log.info(
-          { requestId, prsCreated },
-          'Demo seed completed successfully'
-        );
-
-        return reply.status(200).send({
-          success: true,
-          message: `Successfully created ${prsCreated} demo PRs`,
-          prs_created: prsCreated,
-        });
-      } catch (error: any) {
-        fastify.log.error(
-          {
-            requestId,
-            error: error.message,
-            stack: error.stack,
-          },
-          'Demo seed failed'
-        );
-        return reply.status(500).send({
-          error: {
-            message: 'Failed to seed demo data',
-            code: 'INTERNAL_ERROR',
-            requestId,
-          },
-        });
-      }
+/**
+ * POST /api/demo/seed – development only (DEMO_ENABLED=true, never in
+ * production), and only for an authenticated admin. No browser-side secret.
+ */
+export async function demoRoutes(fastify: FastifyInstance, opts: { prisma: PrismaClient; config: AppConfig }) {
+  fastify.post('/api/demo/seed', { preHandler: [requireAdmin, requireTrustedOrigin(opts.config)] }, async (request, reply) => {
+    if (!opts.config.demoEnabled) {
+      return sendError(reply, 403, 'FORBIDDEN', 'Demo data is disabled on this server');
     }
-  );
-}
+    const result = await seedDemoData(opts.prisma);
+    request.log.info(result, 'Demo data seeded');
+    return {
+      success: true,
+      message: `Demo data ready: ${result.pull_requests} demo PRs (${result.new_scores} new scores)`,
+      prs_created: result.pull_requests,
+      ...result,
+    };
+  });
 
+  fastify.get('/api/demo/status', { preHandler: requireAdmin }, async () => ({ enabled: opts.config.demoEnabled }));
+}

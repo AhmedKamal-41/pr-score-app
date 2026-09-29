@@ -1,4 +1,4 @@
-import { SCORING_RULES } from '../scoring/rules.js';
+import { isCriticalFile } from '../scoring/paths.js';
 
 export interface FileRiskScore {
   filename: string;
@@ -7,41 +7,26 @@ export interface FileRiskScore {
   churn: number;
 }
 
-/**
- * Check if a file path touches critical paths
- */
-function touchesCriticalPath(filePath: string): boolean {
-  return SCORING_RULES.CRITICAL_PATHS.some(({ pattern }) => pattern.test(filePath));
-}
+/** Bonus for files in a critical area (same matcher as the scoring rules). */
+export const CRITICAL_FILE_BONUS = 200;
+export const MAX_AI_FILES = 3;
 
 /**
- * Select top 3 most risky files based on combined score:
- * - Critical path weight: 2x
- * - Churn weight: 1x (additions + deletions)
+ * Rank changed files for AI review: risk = 200 (critical-area bonus) + churn.
+ * Ties break by filename so selection is deterministic. Returns at most 3.
  */
 export function selectRiskyFiles(
   changedFiles: string[],
-  fileChurn: Map<string, { additions: number; deletions: number }>
+  fileChurn: Map<string, { additions: number; deletions: number }>,
+  limit: number = MAX_AI_FILES,
 ): FileRiskScore[] {
-  const scoredFiles: FileRiskScore[] = changedFiles.map((filename) => {
-    const churn = fileChurn.get(filename) || { additions: 0, deletions: 0 };
-    const churnScore = churn.additions + churn.deletions;
-    const isCritical = touchesCriticalPath(filename);
-    
-    // Combined score: critical path weight (2x) + churn weight (1x)
-    const riskScore = (isCritical ? 2 : 0) * 100 + churnScore;
-    
-    return {
-      filename,
-      risk_score: riskScore,
-      is_critical: isCritical,
-      churn: churnScore,
-    };
-  });
-
-  // Sort by risk score (descending) and take top 3
-  return scoredFiles
-    .sort((a, b) => b.risk_score - a.risk_score)
-    .slice(0, 3);
+  return changedFiles
+    .map((filename) => {
+      const churnData = fileChurn.get(filename) ?? { additions: 0, deletions: 0 };
+      const churn = churnData.additions + churnData.deletions;
+      const isCritical = isCriticalFile(filename);
+      return { filename, risk_score: (isCritical ? CRITICAL_FILE_BONUS : 0) + churn, is_critical: isCritical, churn };
+    })
+    .sort((a, b) => b.risk_score - a.risk_score || a.filename.localeCompare(b.filename))
+    .slice(0, limit);
 }
-
