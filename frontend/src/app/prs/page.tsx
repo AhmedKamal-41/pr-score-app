@@ -1,99 +1,96 @@
-import { Suspense } from 'react';
-import { fetchPRs } from '../../lib/api';
-import PrTable from '../../components/PrTable';
-import { TableSkeleton } from '../../components/LoadingSkeleton';
-import ErrorState from '../../components/ErrorState';
-import EmptyState from '../../components/EmptyState';
-import DemoSeedButton from '../../components/DemoSeedButton';
+import Link from 'next/link';
+import ScoreBadge from '@/components/ScoreBadge';
+import StatusPill from '@/components/StatusPill';
+import Pagination from '@/components/Pagination';
+import EmptyState from '@/components/EmptyState';
+import ErrorState from '@/components/ErrorState';
+import DemoSeedButton from '@/components/DemoSeedButton';
+import { navigateForApiError, serverApi, settle } from '@/lib/server-api';
+import { formatDate } from '@/lib/format';
 
-interface SearchParams {
-  limit?: string;
-  offset?: string;
+export const dynamic = 'force-dynamic';
+
+function clampInt(value: string | undefined, fallback: number, min: number, max: number): number {
+  const n = Number.parseInt(value ?? '', 10);
+  return Number.isFinite(n) ? Math.min(Math.max(n, min), max) : fallback;
 }
 
-async function PRList({
-  searchParams,
-}: {
-  searchParams: Promise<SearchParams>;
-}) {
-  try {
-    const params = await searchParams;
-    const limit = parseInt(params.limit || '50', 10);
-    const offset = parseInt(params.offset || '0', 10);
-    const response = await fetchPRs(limit, offset);
+export default async function PRsPage({ searchParams }: { searchParams: Promise<{ limit?: string; offset?: string }> }) {
+  const params = await searchParams;
+  const limit = clampInt(params.limit, 25, 1, 100);
+  const offset = clampInt(params.offset, 0, 0, 1_000_000);
 
-    if (response.data.length === 0) {
-      const demoEnabled = process.env.NEXT_PUBLIC_DEMO_ENABLED === 'true';
-      const demoSecret = process.env.NEXT_PUBLIC_DEMO_SECRET || '';
-      
-      return (
-        <div className="space-y-6">
-          <EmptyState 
-            title="No Pull Requests" 
-            message="No pull requests found. Load demo data to see the dashboard in action."
-          />
-          {demoEnabled && demoSecret && (
-            <div className="flex justify-center">
-              <DemoSeedButton demoSecret={demoSecret} />
-            </div>
-          )}
-        </div>
-      );
-    }
-
-    return (
-      <div className="space-y-4">
-        <PrTable prs={response.data} />
-        {response.pagination.has_more && (
-          <div className="text-center text-sm text-gray-500">
-            Showing {response.pagination.offset + 1}-
-            {response.pagination.offset + response.data.length} of{' '}
-            {response.pagination.total} PRs
-          </div>
-        )}
-      </div>
-    );
-  } catch (error: any) {
-    return (
-      <ErrorState
-        message={error.message || 'Failed to load pull requests'}
-      />
-    );
+  const path = `/prs?limit=${limit}&offset=${offset}`;
+  const result = await settle(serverApi.prs(limit, offset));
+  if (!result.ok) {
+    navigateForApiError(result.error, path);
+    return <ErrorState error={result.error} fallback="Failed to load pull requests" />;
   }
-}
-
-export default async function PRsPage({
-  searchParams,
-}: {
-  searchParams: Promise<SearchParams>;
-}) {
-  const demoEnabled = process.env.NEXT_PUBLIC_DEMO_ENABLED === 'true';
-  const demoSecret = process.env.NEXT_PUBLIC_DEMO_SECRET || '';
+  const data = result.data;
+  let demoEnabled = false;
+  if (data.pagination.total === 0) {
+    const demo = await settle(serverApi.demoStatus());
+    demoEnabled = demo.ok && demo.data.enabled;
+  }
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="mb-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <h1 className="text-3xl font-bold text-gray-900">
-                Pull Requests
-              </h1>
-              <p className="mt-2 text-sm text-gray-600">
-                View and manage pull request risk scores
-              </p>
-            </div>
-            {demoEnabled && demoSecret && (
-              <DemoSeedButton demoSecret={demoSecret} />
-            )}
-          </div>
-        </div>
-
-        <Suspense fallback={<TableSkeleton />}>
-          <PRList searchParams={searchParams} />
-        </Suspense>
+    <div className="space-y-6">
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900">Pull requests</h1>
+        <p className="mt-1 text-sm text-gray-600">Most recently updated first. Scores apply to the revision shown; older-revision scores are labelled.</p>
       </div>
+      {data.pagination.total === 0 ? (
+        <div className="rounded-lg bg-white p-6 shadow">
+          <EmptyState title="No pull requests yet" message="Install the GitHub App on a repository in this workspace, or load demo data locally." />
+          {demoEnabled && <DemoSeedButton />}
+        </div>
+      ) : (
+        <>
+          <div className="overflow-x-auto rounded-lg bg-white shadow">
+            <table className="min-w-full divide-y divide-gray-200 text-sm">
+              <thead className="bg-gray-50 text-left text-gray-900">
+                <tr>
+                  <th scope="col" className="px-4 py-3 font-semibold">Pull request</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Repository</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Risk</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">CI</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">AI</th>
+                  <th scope="col" className="px-4 py-3 font-semibold">Updated on GitHub</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {data.data.map((pr) => (
+                  <tr key={pr.id} className="hover:bg-gray-50">
+                    <td className="px-4 py-3">
+                      <Link href={`/prs/${pr.id}`} className="font-medium text-blue-700 hover:underline">{pr.title}</Link>
+                      <div className="text-gray-500">
+                        #{pr.number ?? '?'} · {pr.merged ? 'merged' : pr.state}
+                        {pr.draft ? ' · draft' : ''} · {pr.author}
+                      </div>
+                    </td>
+                    <td className="px-4 py-3 text-gray-600">
+                      {pr.repository}
+                      {pr.is_demo && <span className="ml-2"><StatusPill label="demo" /></span>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <ScoreBadge score={pr.latest_score?.score ?? null} showScore />
+                      {pr.latest_score && pr.latest_score.revision_status !== 'current' && (
+                        <div className="mt-1 text-xs text-amber-700">{pr.latest_score.revision_status === 'legacy_unknown' ? 'legacy score' : 'older revision'}</div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">{pr.latest_score?.ci_status ? <StatusPill label={pr.latest_score.ci_status} /> : '—'}</td>
+                    <td className="px-4 py-3">
+                      <StatusPill label={pr.processing ? 'processing' : pr.ai_status} />
+                    </td>
+                    <td className="whitespace-nowrap px-4 py-3 text-gray-600">{formatDate(pr.github_updated_at ?? pr.updated_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <Pagination basePath="/prs" limit={limit} offset={offset} total={data.pagination.total} shown={data.data.length} />
+        </>
+      )}
     </div>
   );
 }
-
