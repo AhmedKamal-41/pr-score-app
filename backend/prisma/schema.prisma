@@ -1,5 +1,5 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// Prisma schema for PR Risk Scorer.
+// Migrations in ./migrations are append-only: never edit an applied migration.
 
 generator client {
   provider = "prisma-client-js"
@@ -11,72 +11,200 @@ datasource db {
 }
 
 model Repo {
-  id              String   @id @default(uuid())
-  github_repo_id  BigInt   @unique
-  full_name       String
-  owner           String
-  name            String
-  installation_id BigInt
-  private         Boolean  @default(false)
-  created_at      DateTime @default(now())
-  updated_at      DateTime @updatedAt
+  id                String    @id @default(uuid())
+  github_repo_id    BigInt    @unique
+  full_name         String
+  owner             String
+  name              String
+  installation_id   BigInt
+  /// Mirrors GitHub's `private` flag. Only trustworthy when `visibility` is set.
+  private           Boolean   @default(false)
+  /// public | private | internal as reported by GitHub; NULL = unknown (legacy rows).
+  visibility        String?
+  /// active | revoked. Revoked repositories are neither processed nor served.
+  access_status     String    @default("active")
+  access_revoked_at DateTime?
+  /// Demo rows use negative github_repo_id values so they can never collide with GitHub IDs.
+  is_demo           Boolean   @default(false)
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
 
   pull_requests PullRequest[]
 
+  @@index([installation_id])
   @@map("repos")
 }
 
 model PullRequest {
-  id                String    @id @default(uuid())
-  repo_id           String
-  github_pr_id      BigInt    @unique
-  title             String
-  state             String    // open, closed, merged
-  author            String
-  head_sha          String
-  base_ref          String
-  head_ref          String
-  additions         Int?
-  deletions         Int?
-  changed_files     Int?
-  changed_files_list Json?    // Array of filenames
-  created_at        DateTime  @default(now())
-  updated_at        DateTime  @updatedAt
-  merged_at         DateTime?
+  id                 String    @id @default(uuid())
+  repo_id            String
+  /// LEGACY. Before migration 20260929000000 this column held the repository-local PR
+  /// number and was (incorrectly) globally unique. Kept only for old rows; new rows leave it NULL.
+  github_pr_id       BigInt?
+  /// Repository-local PR number. Unique per repository.
+  number             Int?
+  /// GitHub's global pull request id (`pull_request.id`). Only ever set from GitHub data.
+  github_id          BigInt?   @unique
+  /// verified | legacy_unverified | legacy_invalid_number
+  identity_status    String    @default("verified")
+  title              String
+  state              String // open | closed (merged PRs are closed with merged_at set)
+  draft              Boolean   @default(false)
+  author             String
+  head_sha           String
+  base_ref           String
+  head_ref           String
+  additions          Int?
+  deletions          Int?
+  changed_files      Int?
+  changed_files_list Json? // string[] of filenames
+  github_created_at  DateTime? // PR creation time on GitHub
+  github_updated_at  DateTime? // last update time on GitHub
+  closed_at          DateTime?
+  merged_at          DateTime?
+  created_at         DateTime  @default(now()) // first ingestion into this system
+  updated_at         DateTime  @updatedAt // last local write
+  bot_comment_id     BigInt? // id of this app's single analysis comment
+  bot_comment_sha    String? // head SHA reflected in that comment
 
-  repo   Repo       @relation(fields: [repo_id], references: [id], onDelete: Cascade)
-  scores PrScore[]
-  ai_analyses PrAiAnalysis[]
+  repo          Repo           @relation(fields: [repo_id], references: [id], onDelete: Cascade)
+  scores        PrScore[]
+  ai_analyses   PrAiAnalysis[]
+  analysis_runs AnalysisRun[]
 
+  @@unique([repo_id, number])
+  @@index([repo_id, head_sha])
+  @@index([updated_at, id])
   @@map("pull_requests")
 }
 
 model PrScore {
-  id             String   @id @default(uuid())
-  pull_request_id String
-  score          Float
-  level          String   // low, medium, high, critical
-  reasons        Json     // Array of reason objects
-  features       Json     // Feature extraction data
-  created_at     DateTime @default(now())
-  updated_at     DateTime @updatedAt
+  id                String   @id @default(uuid())
+  pull_request_id   String
+  score             Float
+  level             String // low | medium | high
+  reasons           Json // string[] (legacy rows may contain {message} objects)
+  features          Json
+  /// Head SHA the score was computed for. NULL = unknown (legacy rows).
+  head_sha          String?
+  /// Scoring contract version. "legacy" = produced before contract v2 (unknown CI penalty).
+  scoring_version   String   @default("legacy")
+  ci_status         String?
+  /// Every rule contribution, including those beyond the top three reasons.
+  contributions     Json?
+  /// Completeness information about the file list used for scoring.
+  coverage          Json?
+  input_fingerprint String?
+  run_id            String?  @unique
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
 
-  pull_request PullRequest @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+  pull_request PullRequest  @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+  run          AnalysisRun? @relation(fields: [run_id], references: [id], onDelete: SetNull)
 
+  @@unique([pull_request_id, input_fingerprint])
+  @@index([pull_request_id, created_at, id])
   @@map("pr_scores")
 }
 
 model PrAiAnalysis {
-  id             String   @id @default(uuid())
-  pull_request_id String
-  analysis_json  Json     // AI output schema
-  model          String   // e.g., "gpt-4o-mini"
-  prompt_version String   // e.g., "v1"
-  created_at     DateTime @default(now())
-  updated_at     DateTime @updatedAt
+  id                String   @id @default(uuid())
+  pull_request_id   String
+  analysis_json     Json // AiOutput
+  model             String
+  prompt_version    String
+  head_sha          String? // NULL = unknown (legacy rows)
+  input_fingerprint String?
+  limitations       Json? // omitted/truncated/binary content report
+  run_id            String?  @unique
+  created_at        DateTime @default(now())
+  updated_at        DateTime @updatedAt
 
-  pull_request PullRequest @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+  pull_request PullRequest  @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+  run          AnalysisRun? @relation(fields: [run_id], references: [id], onDelete: SetNull)
 
+  @@index([pull_request_id, created_at, id])
   @@map("pr_ai_analyses")
 }
 
+/// One deterministic analysis of one PR revision with one set of inputs.
+/// Identity = (pull_request_id, input_fingerprint): replays never create duplicates,
+/// while a CI change on the same head SHA yields a new fingerprint and a new run.
+model AnalysisRun {
+  id                  String    @id @default(uuid())
+  pull_request_id     String
+  head_sha            String
+  input_fingerprint   String
+  scoring_version     String
+  ci_status           String
+  trigger_delivery_id String?
+  /// pending | disabled | succeeded | unavailable | failed | superseded
+  ai_status           String
+  ai_error            String?
+  ai_attempts         Int       @default(0)
+  /// disabled | pending | succeeded | failed | superseded | skipped
+  comment_status      String
+  comment_error       String?
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+  completed_at        DateTime?
+
+  pull_request PullRequest   @relation(fields: [pull_request_id], references: [id], onDelete: Cascade)
+  score        PrScore?
+  ai_analysis  PrAiAnalysis?
+
+  @@unique([pull_request_id, input_fingerprint])
+  @@index([pull_request_id, created_at, id])
+  @@map("analysis_runs")
+}
+
+/// Durable webhook inbox. A delivery is acknowledged to GitHub only after this row commits.
+model WebhookDelivery {
+  id              String    @id // X-GitHub-Delivery GUID
+  event           String
+  action          String?
+  payload_sha256  String // detects conflicting reuse of a delivery id
+  /// received | queued | processing | succeeded | ignored | failed | dead
+  status          String
+  installation_id BigInt?
+  repo_github_id  BigInt?
+  repo_full_name  String?
+  pr_number       Int?
+  head_sha        String?
+  /// Minimal fields needed to process/recover the event (never the full payload or diffs).
+  payload         Json
+  attempts        Int       @default(0)
+  last_error      String?
+  ignored_reason  String?
+  next_attempt_at DateTime?
+  enqueued_at     DateTime?
+  received_at     DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+  processed_at    DateTime?
+
+  @@index([status, next_attempt_at])
+  @@index([received_at])
+  @@map("webhook_deliveries")
+}
+
+/// Cross-process mutual exclusion for work on one PR (key = "<repo_github_id>:<number>").
+model ProcessingLease {
+  key        String   @id
+  owner      String
+  expires_at DateTime
+
+  @@map("processing_leases")
+}
+
+/// Server-side dashboard sessions. `id` is the SHA-256 of the cookie token.
+model AdminSession {
+  id           String    @id
+  username     String
+  created_at   DateTime  @default(now())
+  expires_at   DateTime
+  last_seen_at DateTime  @default(now())
+  revoked_at   DateTime?
+
+  @@index([expires_at])
+  @@map("admin_sessions")
+}
