@@ -58,9 +58,6 @@ backend/prisma/*.db-journal
 *.sqlite3
 *.db
 
-# Docker
-.dockerignore
-
 # Temporary files
 *.tmp
 *.temp
@@ -79,14 +76,13 @@ coverage/
 
 # Secrets and keys
 *.key
-*.pem
 *.p12
 *.pfx
 secrets/
 .secrets/
 
-# Lock files (optional - some teams commit these)
-# pnpm-lock.yaml
-# package-lock.json
-# yarn.lock
+# Lock files: pnpm-lock.yaml is committed (installs use --frozen-lockfile).
+# Other package managers' lockfiles must not be created in this repository.
+package-lock.json
+yarn.lock
 

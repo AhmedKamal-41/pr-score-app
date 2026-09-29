@@ -1,5 +1,5 @@
-version: '3.8'
-
+# Local development services. Ports are bound to 127.0.0.1 only, so the
+# development database and Redis are never exposed on other interfaces.
 services:
   postgres:
     image: postgres:16-alpine
@@ -9,29 +9,30 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pr_risk_scorer
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   redis:
     image: redis:7-alpine
     container_name: pr-risk-scorer-redis
+    # BullMQ requires that Redis never evicts queue keys.
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
 volumes:
   postgres_data:
   redis_data:
-

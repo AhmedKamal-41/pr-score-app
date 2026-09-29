@@ -2,3 +2,20 @@ packages:
   - 'backend'
   - 'frontend'
 
+# pnpm >= 10 blocks dependency build scripts unless explicitly allowed.
+# Allowed: Prisma downloads its query engine, esbuild installs its platform
+# binary, and msgpackr-extract (BullMQ) builds an optional native addon.
+# Denied: unrs-resolver ships prebuilt optional bindings; its postinstall is
+# only a download fallback.
+allowBuilds:
+  '@prisma/client': true
+  '@prisma/engines': true
+  esbuild: true
+  msgpackr-extract: true
+  prisma: true
+  unrs-resolver: false
+
+# next@15.5.x pins postcss 8.4.31, which has published advisories
+# (GHSA-6g55-p6wh-862q and follow-ups). postcss 8.5.x is API-compatible.
+overrides:
+  'next>postcss': ^8.5.28
