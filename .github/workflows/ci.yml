@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Automated checks never reach real GitHub/OpenAI (tests also block
+  # non-loopback network access), and never post comments.
+  AI_ENABLED: 'false'
+  GITHUB_POST_COMMENTS: 'false'
+  NEXT_TELEMETRY_DISABLED: '1'
+  TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/pr_risk_scorer_test
+  TEST_REDIS_URL: redis://127.0.0.1:56379/1
+
+jobs:
+  static:
+    name: Lint, typecheck, unit tests, builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # pnpm must be installed before setup-node can use its store cache.
+      - uses: pnpm/action-setup@v4 # version comes from package.json "packageManager"
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter backend db:generate
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - name: Unit tests (backend + frontend)
+        run: pnpm test
+      - name: Production builds (frontend builds without a running backend)
+        run: pnpm build
+      - name: Dependency audit
+        run: pnpm audit --audit-level=moderate
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-coverage
+          path: backend/coverage/
+          retention-days: 7
+
+  integration:
+    name: Integration, migrations and end-to-end
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pr_risk_scorer_test
+        ports: ['55432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports: ['56379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter backend db:generate
+      - name: Verify migrations reproduce the Prisma schema
+        env:
+          PGPASSWORD: postgres
+          SHADOW_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/shadow_test
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:55432/shadow_test
+        run: |
+          psql -h 127.0.0.1 -p 55432 -U postgres -c 'CREATE DATABASE shadow_test'
+          pnpm --filter backend db:check
+      - name: Integration tests (real PostgreSQL + Redis, mocked GitHub/OpenAI; includes upgrade migration)
+        run: pnpm test:integration
+      - name: End-to-end smoke test (compiled API + worker + Next.js)
+        run: pnpm test:e2e
