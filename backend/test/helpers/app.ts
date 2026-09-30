@@ -4,7 +4,7 @@ import type { PrismaClient } from '@prisma/client';
 import type { AppConfig } from '../../src/config/env.js';
 import { buildApp } from '../../src/app.js';
 import { createProducerRedis } from '../../src/lib/redis.js';
-import { createEventsQueue, type EventsQueue } from '../../src/lib/queue.js';
+import { closeQueueAndConnection, createEventsQueue, type EventsQueue } from '../../src/lib/queue.js';
 import { signPayload } from '../../src/webhooks/signature.js';
 import type { Logger } from '../../src/lib/logger.js';
 import { TEST_ADMIN, TEST_ORIGIN, TEST_WEBHOOK_SECRET } from './config.js';
@@ -29,8 +29,7 @@ export async function buildTestApp(config: AppConfig, prisma: PrismaClient, redi
     queue,
     close: async () => {
       await app.close();
-      await queue.close().catch(() => {});
-      redis.disconnect();
+      await closeQueueAndConnection(queue, redis);
     },
   };
 }

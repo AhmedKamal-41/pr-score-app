@@ -9,7 +9,7 @@ import { MockGitHub, pullRequestPayload, sha } from '../helpers/mock-github.js';
 import { TEST_REDIS_URL } from '../helpers/env.js';
 import { createDeliveryProcessor, startDispatcher } from '../../src/jobs/runtime.js';
 import { dispatchDueDeliveries, recoverDeliveries, PROCESSING_STALE_MS, QUEUED_STALE_MS } from '../../src/jobs/dispatch.js';
-import { createEventsQueue, type DeliveryJobData, type EventsQueue } from '../../src/lib/queue.js';
+import { closeQueueAndConnection, createEventsQueue, type DeliveryJobData, type EventsQueue } from '../../src/lib/queue.js';
 import { createWorkerRedis } from '../../src/lib/redis.js';
 import { EVENTS_QUEUE } from '../../src/config/constants.js';
 
@@ -62,8 +62,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  await queue.close();
-  queueConn.disconnect();
+  await closeQueueAndConnection(queue, queueConn);
   await t.close();
   await gh.stop();
   await prisma.$disconnect();

@@ -4,7 +4,7 @@ import { loadConfig } from '../config/env.js';
 import { createLogger } from '../lib/logger.js';
 import { createPrisma } from '../lib/prisma.js';
 import { createWorkerRedis } from '../lib/redis.js';
-import { createEventsQueue } from '../lib/queue.js';
+import { closeQueueAndConnection, createEventsQueue } from '../lib/queue.js';
 import { recoverDeliveries } from '../jobs/dispatch.js';
 
 /**
@@ -26,7 +26,9 @@ const { values } = parseArgs({
 const config = loadConfig();
 const prisma = createPrisma(config.databaseUrl);
 const redis = createWorkerRedis(config.redisUrl);
+redis.on('error', () => {});
 const queue = createEventsQueue(redis);
+queue.on('error', () => {});
 const logger = createLogger({ ...config, logLevel: 'warn' }, 'recover');
 
 try {
@@ -49,7 +51,6 @@ try {
     }
   }
 } finally {
-  await queue.close();
-  await redis.quit();
+  await closeQueueAndConnection(queue, redis);
   await prisma.$disconnect();
 }

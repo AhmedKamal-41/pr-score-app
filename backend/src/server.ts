@@ -3,7 +3,7 @@ import { loadConfig } from './config/env.js';
 import { createLogger } from './lib/logger.js';
 import { createPrisma } from './lib/prisma.js';
 import { createProducerRedis } from './lib/redis.js';
-import { createEventsQueue } from './lib/queue.js';
+import { closeQueueAndConnection, createEventsQueue } from './lib/queue.js';
 import { buildApp } from './app.js';
 
 /** API server entry point: `node dist/server.js` (or `tsx src/server.ts`). */
@@ -31,8 +31,7 @@ async function main() {
     force.unref();
     try {
       await app.close(); // stops accepting connections, waits for in-flight requests
-      await queue.close();
-      await redis.quit().catch(() => redis.disconnect());
+      await closeQueueAndConnection(queue, redis);
       await prisma.$disconnect();
       process.exit(0);
     } catch (err) {

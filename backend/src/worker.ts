@@ -6,7 +6,7 @@ import { EVENTS_QUEUE } from './config/constants.js';
 import { createLogger } from './lib/logger.js';
 import { createPrisma } from './lib/prisma.js';
 import { createWorkerRedis } from './lib/redis.js';
-import { createEventsQueue, type DeliveryJobData } from './lib/queue.js';
+import { closeQueueAndConnection, createEventsQueue, type DeliveryJobData } from './lib/queue.js';
 import { createDeliveryProcessor, startDispatcher } from './jobs/runtime.js';
 
 /** Worker entry point: `node dist/worker.js` (or `tsx src/worker.ts`). */
@@ -16,7 +16,9 @@ async function main() {
   const prisma = createPrisma(config.databaseUrl);
   const connection = createWorkerRedis(config.redisUrl);
   connection.on('error', (err) => logger.warn({ err: err.message }, 'Redis connection error'));
-  const queue = createEventsQueue(createWorkerRedis(config.redisUrl));
+  const queueConnection = createWorkerRedis(config.redisUrl);
+  queueConnection.on('error', () => {}); // reported via the queue's 'error' event
+  const queue = createEventsQueue(queueConnection);
   queue.on('error', (err) => logger.warn({ err: err.message }, 'Queue connection error'));
 
   const workerId = `${hostname()}:${process.pid}`;
@@ -43,7 +45,7 @@ async function main() {
     try {
       await dispatcher.stop();
       await worker.close(); // waits for in-flight jobs
-      await queue.close();
+      await closeQueueAndConnection(queue, queueConnection);
       await connection.quit().catch(() => connection.disconnect());
       await prisma.$disconnect();
       logger.info('Worker stopped');
