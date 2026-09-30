@@ -748,11 +748,6 @@ pr-score-app/
 - Publish a Check Run with the score so it appears directly in the pull request's checks.
 - Support more than one dashboard user with roles.
 - Add container images and a reference deployment.
-
-## Author
-
-- **Ahmed Ali** — [GitHub](https://github.com/AhmedKamal-41)
-
 ---
 
 <div align="center">
