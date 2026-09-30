@@ -2,7 +2,7 @@
   <img src="docs/logo.svg" alt="PR Risk Scorer shield logo with a risk gauge" width="120" />
 </div>
 
-# PR Risk Scorer — GitHub Pull Request Risk Analysis
+# PR Risk Scorer - GitHub Pull Request Risk Analysis
 
 A GitHub App and private dashboard that tells reviewers which pull requests deserve attention first.
 For every pull request revision it receives GitHub's signed webhook, stores it durably, fetches the
